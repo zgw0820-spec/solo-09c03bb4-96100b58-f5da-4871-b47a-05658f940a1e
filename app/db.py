@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     cpu_capacity INTEGER NOT NULL CHECK (cpu_capacity > 0),
     status TEXT NOT NULL DEFAULT 'ready'
         CHECK (status IN ('ready', 'draining', 'drained')),
+    -- Power drill state: 0 = simulated power cut, 1 = powered. Orthogonal to
+    -- the drain lifecycle status above; persisted so a restart keeps faults.
+    powered_on INTEGER NOT NULL DEFAULT 1 CHECK (powered_on IN (0, 1)),
     position INTEGER NOT NULL DEFAULT 0
 );
 
@@ -97,8 +100,22 @@ class Database:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring databases created by older versions up to date, in place."""
+        node_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(nodes)")
+        }
+        if "powered_on" not in node_columns:
+            conn.execute(
+                "ALTER TABLE nodes "
+                "ADD COLUMN powered_on INTEGER NOT NULL DEFAULT 1 "
+                "CHECK (powered_on IN (0, 1))"
+            )
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:

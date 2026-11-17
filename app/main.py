@@ -149,6 +149,14 @@ def create_app(
     def restore_node(node_id: str) -> dict[str, Any]:
         return service.restore_node(database, node_id)
 
+    @app.post("/api/nodes/{node_id}/power-off")
+    def power_off_node(node_id: str) -> dict[str, Any]:
+        return service.power_off_node(database, node_id)
+
+    @app.post("/api/nodes/{node_id}/power-on")
+    def power_on_node(node_id: str) -> dict[str, Any]:
+        return service.power_on_node(database, node_id)
+
     @app.post("/api/migrations/{migration_id}/resolve")
     def resolve_migration(
         migration_id: int, request: ResolveRequest

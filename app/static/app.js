@@ -34,6 +34,7 @@ const STATUS_LABELS = {
   ready: "就绪",
   draining: "排空中",
   drained: "已空",
+  offline: "已断电",
   serving: "服务中",
   starting: "新副本启动中",
   completed: "已完成",
@@ -48,6 +49,7 @@ const REASON_LABELS = {
   NO_USABLE_TARGET: "没有可用目标节点",
   REPLICA_START_FAILED: "新副本模拟启动失败",
   RESERVATION_LOST: "目标容量预留失效",
+  TARGET_POWERED_OFF: "目标节点断电，预留已释放",
 };
 
 function escapeHtml(value) {
@@ -211,6 +213,12 @@ function renderTopbar(data) {
         `<span class="pill danger">${data.unfinished_drain_count} 个排空未完成，可继续</span>`
       );
     }
+    if (data.powered_off_node_id) {
+      const offNode = data.nodes.find((n) => n.id === data.powered_off_node_id);
+      chips.push(
+        `<span class="pill danger">⚡ ${escapeHtml(offNode?.name || data.powered_off_node_id)} 断电中，副本暂不计就绪</span>`
+      );
+    }
     if (data.blocked_containers.length) {
       chips.push(
         `<span class="pill danger">${data.blocked_containers.length} 个容器受阻</span>`
@@ -252,12 +260,16 @@ function renderNodes(data) {
       const canDrain = node.can_drain && !STATE.busy;
       const canResume = node.can_resume && !STATE.busy;
       const canRestore = node.can_restore && !STATE.busy;
+      const canPowerOff = node.can_power_off && !STATE.busy;
+      const canPowerOn = node.can_power_on && !STATE.busy;
       const inbound = node.inbound_reservations.length;
-      const statusChip = node.is_empty
-        ? `<span class="badge drained">已空</span>`
-        : statusBadge(node.status);
+      const statusChip = !node.powered_on
+        ? `<span class="badge offline">已断电</span>`
+        : node.is_empty
+          ? `<span class="badge drained">已空</span>`
+          : statusBadge(node.status);
       return `
-        <article class="node-card ${escapeHtml(node.status)} ${selected}" data-node="${escapeHtml(node.id)}">
+        <article class="node-card ${escapeHtml(node.status)} ${node.powered_on ? "" : "offline"} ${selected}" data-node="${escapeHtml(node.id)}">
           <div class="node-head">
             <div class="node-title">
               <strong>${escapeHtml(node.name)}</strong>
@@ -266,11 +278,15 @@ function renderNodes(data) {
             <div class="node-actions">
               ${statusChip}
               <button class="btn small" data-action="drain" data-node-id="${escapeHtml(node.id)}"
-                ${canDrain ? "" : "disabled"} title="预留容量并开始迁移副本">排空</button>
+                ${canDrain ? "" : "disabled"} title="${node.powered_on ? "预留容量并开始迁移副本" : "断电节点不能发起排空"}">排空</button>
               <button class="btn small ghost" data-action="resume" data-node-id="${escapeHtml(node.id)}"
-                ${canResume ? "" : "disabled"} title="重试受阻容器">继续</button>
+                ${canResume ? "" : "disabled"} title="${node.powered_on ? "重试受阻容器" : "断电节点不能继续排空"}">继续</button>
               <button class="btn small ghost" data-action="restore" data-node-id="${escapeHtml(node.id)}"
                 ${canRestore ? "" : "disabled"} title="把已排空节点恢复为可用，便于再次演练">恢复</button>
+              <button class="btn small danger" data-action="power-off" data-node-id="${escapeHtml(node.id)}"
+                ${canPowerOff ? "" : "disabled"} title="${data.powered_off_node_id && node.powered_on ? "同一时刻仅允许一台节点断电" : "模拟该节点突然断电"}">断电</button>
+              <button class="btn small ok" data-action="power-on" data-node-id="${escapeHtml(node.id)}"
+                ${canPowerOn ? "" : "disabled"} title="恢复供电：仍在该节点的副本重新计入就绪">恢复供电</button>
             </div>
           </div>
           ${capacityBar(node)}
@@ -279,6 +295,7 @@ function renderNodes(data) {
             <span><i class="dot reserved"></i>预留 ${node.reserved_cpu}</span>
             <span><i class="dot free"></i>剩余 ${node.remaining_cpu}</span>
           </div>
+          ${!node.powered_on ? `<p class="offline-hint">⚡ 已断电：副本暂不计就绪，不能作为迁移落点，也不能发起或继续排空</p>` : ""}
           ${drain ? `<p class="hint" style="margin:8px 0 0">排空 #${drain.id}：${STATUS_LABELS[drain.status] || drain.status} ${drain.moved}/${drain.total}，节点上还剩 ${drain.remaining_on_node} 个副本</p>` : ""}
         </article>`;
     })
@@ -288,7 +305,7 @@ function renderNodes(data) {
 function renderServices(data) {
   const body = $("service-body");
   if (!data.services.length) {
-    body.innerHTML = `<tr><td colspan="4" class="empty-cell">暂无数据</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" class="empty-cell">暂无数据</td></tr>`;
     return;
   }
   body.innerHTML = data.services
@@ -299,6 +316,9 @@ function renderServices(data) {
           <td><b>${escapeHtml(service.name)}</b></td>
           <td>${service.ready} / ${service.min_ready}</td>
           <td>${service.starting_replicas || "—"}</td>
+          <td>${service.offline_replicas
+            ? `<span class="badge offline">${service.offline_replicas} 个</span>`
+            : "—"}</td>
           <td>${healthy
             ? `<span class="badge ready">满足</span>`
             : `<span class="badge blocked">不足</span>`}</td>
@@ -469,6 +489,7 @@ function renderContainers(data) {
   body.innerHTML = data.containers
     .map((container) => {
       const node = data.nodes.find((n) => n.id === container.node_id);
+      const nodeOffline = node && !node.powered_on;
       let migrationCell = "—";
       if (container.migration) {
         const target = data.nodes.find((n) => n.id === container.migration.target_node_id);
@@ -481,13 +502,16 @@ function renderContainers(data) {
           container.blocked_attempt.error || ""
         )}">${escapeHtml(reason)}</span>`;
       }
+      const statusCell = nodeOffline
+        ? `<span class="badge offline" title="节点断电，暂不计入业务就绪数">离线</span>`
+        : statusBadge(container.status);
       return `
         <tr>
           <td><b>${escapeHtml(container.name)}</b><br><span class="hint">${escapeHtml(container.id)}</span></td>
           <td>${escapeHtml(container.service)}</td>
           <td>${container.cpu_request}</td>
           <td>${escapeHtml(node?.name || container.node_id)}</td>
-          <td>${statusBadge(container.status)}</td>
+          <td>${statusCell}</td>
           <td>${migrationCell}</td>
         </tr>`;
     })
@@ -669,6 +693,35 @@ function wireActions() {
       const nodeId = button.dataset.nodeId;
       const data = await mutate(`/api/nodes/${encodeURIComponent(nodeId)}/restore`);
       if (data) toast("节点已恢复可用", "ok");
+      return;
+    }
+
+    if (action === "power-off") {
+      const nodeId = button.dataset.nodeId;
+      const node = STATE.data?.nodes.find((n) => n.id === nodeId);
+      const ok = window.confirm(
+        `确定模拟「${node?.name || nodeId}」突然断电吗？\n` +
+          "其副本将暂不计入业务就绪数，指向它的未决启动会立即失败并释放预留。"
+      );
+      if (!ok) return;
+      STATE.selectedNode = nodeId;
+      const data = await mutate(`/api/nodes/${encodeURIComponent(nodeId)}/power-off`);
+      if (data) {
+        const unhealthy = data.services.filter((s) => !s.healthy);
+        toast(
+          unhealthy.length
+            ? `节点已断电：${unhealthy.map((s) => s.name).join("、")} 跌破最小就绪数`
+            : "节点已断电：所有业务仍满足最小就绪数",
+          unhealthy.length ? "error" : "ok"
+        );
+      }
+      return;
+    }
+
+    if (action === "power-on") {
+      const nodeId = button.dataset.nodeId;
+      const data = await mutate(`/api/nodes/${encodeURIComponent(nodeId)}/power-on`);
+      if (data) toast("已恢复供电：仍在该节点的副本重新计入就绪数", "ok");
       return;
     }
 

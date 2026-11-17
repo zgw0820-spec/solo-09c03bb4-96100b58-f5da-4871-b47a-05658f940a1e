@@ -15,6 +15,21 @@ Invariants enforced inside every ``BEGIN IMMEDIATE`` SQLite transaction:
 * Every mutation re-reads state under the write lock, so concurrent drains
   cannot double-book capacity. Nothing is rebuilt in memory at startup: an
   interrupted drain resumes from the persisted SQLite state.
+
+Power-cut drill (one node at a time):
+
+* Replicas placed on a powered-off node do not count towards their service's
+  ready number until power is restored, and the node cannot receive new
+  migrations, start a drain, or resume one.
+* Powering a node off fails every ``starting`` migration that targeted it in
+  the same transaction, releasing the CPU reservations; the source replicas
+  stay where they are and their drains turn incomplete with the reason
+  ``TARGET_POWERED_OFF``. Pending starts aimed at other nodes stay decidable.
+* A power cut and a "new replica ready" decision are serialised by the write
+  lock: whichever commits first decides where the replica ends up. The loser
+  gets a coherent error instead of a stale write.
+* Restoring power changes nothing retroactively: only the replicas still
+  placed on the node at that moment count as ready again.
 """
 
 from __future__ import annotations
@@ -130,6 +145,26 @@ def _draining_node_ids(conn: sqlite3.Connection) -> set[str]:
             "SELECT node_id FROM drains WHERE status IN ('active','incomplete')"
         ).fetchall()
     }
+
+
+def _powered_off_node_ids(conn: sqlite3.Connection) -> set[str]:
+    return {
+        row["id"]
+        for row in conn.execute("SELECT id FROM nodes WHERE powered_on = 0").fetchall()
+    }
+
+
+def _ready_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Ready replicas per service: serving, and not on a powered-off node."""
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT c.service AS service, COUNT(*) AS n FROM containers c "
+        "JOIN nodes n ON n.id = c.node_id "
+        "WHERE c.status = 'serving' AND n.powered_on = 1 "
+        "GROUP BY c.service"
+    ).fetchall():
+        counts[row["service"]] = row["n"]
+    return counts
 
 
 def _attempts(conn: sqlite3.Connection, drain_id: int) -> list[sqlite3.Row]:
@@ -250,12 +285,17 @@ def snapshot(db: Database) -> dict[str, Any]:
             for drain in open_drains
         }
         pending = _pending_migrations(conn)
+        powered_off_ids = _powered_off_node_ids(conn)
 
-        ready_by_service: dict[str, int] = {}
+        ready_by_service = _ready_counts(conn)
+        offline_by_service: dict[str, int] = {}
         for container in containers:
-            if container["status"] == "serving":
-                ready_by_service[container["service"]] = (
-                    ready_by_service.get(container["service"], 0) + 1
+            if (
+                container["status"] == "serving"
+                and container["node_id"] in powered_off_ids
+            ):
+                offline_by_service[container["service"]] = (
+                    offline_by_service.get(container["service"], 0) + 1
                 )
 
         blocked_containers: list[dict[str, Any]] = []
@@ -312,6 +352,7 @@ def snapshot(db: Database) -> dict[str, Any]:
                         node["cpu_capacity"] - row["serving"] - row["reserved"], 0
                     ),
                     "status": node["status"],
+                    "powered_on": bool(node["powered_on"]),
                     "serving_containers": len(serving_here),
                     "inbound_reservations": [
                         {
@@ -328,13 +369,15 @@ def snapshot(db: Database) -> dict[str, Any]:
                         if last_completed is not None and drain is None
                         else None
                     ),
-                    "can_drain": (
-                        node["status"] == "ready"
+                    "can_drain": bool(
+                        node["powered_on"]
+                        and node["status"] == "ready"
                         and drain is None
                         and not inbound
                     ),
-                    "can_resume": (
-                        drain is not None
+                    "can_resume": bool(
+                        node["powered_on"]
+                        and drain is not None
                         and drain["status"] == "incomplete"
                         and not inbound
                     ),
@@ -345,6 +388,12 @@ def snapshot(db: Database) -> dict[str, Any]:
                         and not inbound
                         and drain is None
                     ),
+                    # Only one node may be powered off at a time, so a live
+                    # node can be cut only while no other node is off.
+                    "can_power_off": bool(
+                        node["powered_on"] and not powered_off_ids
+                    ),
+                    "can_power_on": not node["powered_on"],
                     # Derived, never stored: a node only counts as empty with
                     # zero serving replicas and zero reservations on it.
                     "is_empty": (
@@ -407,6 +456,9 @@ def snapshot(db: Database) -> dict[str, Any]:
                     "ready": ready,
                     "defined": defined,
                     "starting_replicas": starting,
+                    # Replicas sitting on the powered-off node: still placed,
+                    # but not ready until power returns.
+                    "offline_replicas": offline_by_service.get(service["name"], 0),
                     "healthy": ready >= service["min_ready"],
                 }
             )
@@ -422,6 +474,7 @@ def snapshot(db: Database) -> dict[str, Any]:
             "services": service_payload,
             "blocked_containers": blocked_containers,
             "open_drains": [drain_public[drain["id"]] for drain in open_drains],
+            "powered_off_node_id": next(iter(powered_off_ids), None),
             "drains": [
                 drain_public.get(drain["id"])
                 or _drain_public(conn, drain)
@@ -635,6 +688,9 @@ def _candidate_targets(
             continue
         if node["id"] in draining or node["status"] != "ready":
             continue
+        if not node["powered_on"]:
+            # A powered-off node can never be a migration target.
+            continue
         used = usage.get(node["id"], {"serving": 0, "reserved": 0})
         free = node["cpu_capacity"] - used["serving"] - used["reserved"]
         candidates.append((node, free))
@@ -653,13 +709,7 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
     is ready, so the drain cannot pull a service below ``min_ready``; when
     capacity is scarce the ordering just decides who gets it first.
     """
-    ready_by_service: dict[str, int] = {
-        row["service"]: row["n"]
-        for row in conn.execute(
-            "SELECT service, COUNT(*) AS n FROM containers "
-            "WHERE status = 'serving' GROUP BY service"
-        ).fetchall()
-    }
+    ready_by_service = _ready_counts(conn)
     min_ready = {row["name"]: row["min_ready"] for row in _service_rows(conn)}
 
     def surplus(container: sqlite3.Row) -> int:
@@ -691,7 +741,7 @@ def _schedule(conn: sqlite3.Connection, drain_id: int, node_id: str) -> None:
                 code = "NO_USABLE_TARGET"
                 message = (
                     "no other node can host a new replica (remaining nodes are "
-                    "draining or drained)"
+                    "draining, drained or powered off)"
                 )
             else:
                 free_summary = ", ".join(
@@ -738,6 +788,12 @@ def start_drain(db: Database, node_id: str) -> dict[str, Any]:
         node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         if node is None:
             raise ApiError(404, "NODE_NOT_FOUND", f"node {node_id!r} does not exist")
+        if not node["powered_on"]:
+            raise ApiError(
+                409,
+                "NODE_POWERED_OFF",
+                f"node {node_id!r} is powered off; restore power before draining",
+            )
 
         existing = _open_drain_for_node(conn, node_id)
         if existing is not None:
@@ -781,6 +837,12 @@ def resume_drain(db: Database, node_id: str) -> dict[str, Any]:
         node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
         if node is None:
             raise ApiError(404, "NODE_NOT_FOUND", f"node {node_id!r} does not exist")
+        if not node["powered_on"]:
+            raise ApiError(
+                409,
+                "NODE_POWERED_OFF",
+                f"node {node_id!r} is powered off; restore power before resuming",
+            )
         drain = _open_drain_for_node(conn, node_id)
         if drain is None:
             raise ApiError(
@@ -888,37 +950,52 @@ def resolve_migration(
             target = conn.execute(
                 "SELECT * FROM nodes WHERE id = ?", (target_id,)
             ).fetchone()
-            usage = _usage(conn)
-            target_usage = usage.get(target_id, {"serving": 0, "reserved": 0})
-            others = target_usage["serving"] + target_usage["reserved"] - migration[
-                "reserved_cpu"
-            ]
-            reservation_ok = (
-                target is not None
-                and target_id not in _draining_node_ids(conn)
-                and target["cpu_capacity"] - others >= migration["reserved_cpu"]
-            )
-            if not reservation_ok:
-                # Should be unreachable while reservations are honoured; keeps
-                # the invariant explicit rather than silently overcommitting.
+            if target is not None and not target["powered_on"]:
+                # Unreachable while power cuts fail inbound reservations
+                # atomically; kept explicit so a cutover can never land on a
+                # dead node even if the interleaving changes.
                 conn.execute(
                     "UPDATE migrations SET state = 'failed', "
-                    "error_code = 'RESERVATION_LOST', error = ?, updated_at = ? "
+                    "error_code = 'TARGET_POWERED_OFF', error = ?, updated_at = ? "
                     "WHERE id = ?",
-                    (reason or "target reservation is no longer valid", utcnow(), migration_id),
+                    (
+                        reason or "target node is powered off; reservation released",
+                        utcnow(),
+                        migration_id,
+                    ),
                 )
             else:
-                # Atomic cutover: the new replica takes the reserved capacity
-                # and the old replica stops in the same transaction.
-                conn.execute(
-                    "UPDATE containers SET node_id = ? WHERE id = ?",
-                    (target_id, container["id"]),
+                usage = _usage(conn)
+                target_usage = usage.get(target_id, {"serving": 0, "reserved": 0})
+                others = target_usage["serving"] + target_usage["reserved"] - migration[
+                    "reserved_cpu"
+                ]
+                reservation_ok = (
+                    target is not None
+                    and target_id not in _draining_node_ids(conn)
+                    and target["cpu_capacity"] - others >= migration["reserved_cpu"]
                 )
-                conn.execute(
-                    "UPDATE migrations SET state = 'completed', updated_at = ? "
-                    "WHERE id = ?",
-                    (utcnow(), migration_id),
-                )
+                if not reservation_ok:
+                    # Should be unreachable while reservations are honoured; keeps
+                    # the invariant explicit rather than silently overcommitting.
+                    conn.execute(
+                        "UPDATE migrations SET state = 'failed', "
+                        "error_code = 'RESERVATION_LOST', error = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (reason or "target reservation is no longer valid", utcnow(), migration_id),
+                    )
+                else:
+                    # Atomic cutover: the new replica takes the reserved capacity
+                    # and the old replica stops in the same transaction.
+                    conn.execute(
+                        "UPDATE containers SET node_id = ? WHERE id = ?",
+                        (target_id, container["id"]),
+                    )
+                    conn.execute(
+                        "UPDATE migrations SET state = 'completed', updated_at = ? "
+                        "WHERE id = ?",
+                        (utcnow(), migration_id),
+                    )
         else:
             # Failure releases the reservation; the old replica never stopped.
             conn.execute(
@@ -929,4 +1006,78 @@ def resolve_migration(
             )
 
         _finalize_drain(conn, migration["drain_id"])
+    return snapshot(db)
+
+
+# --------------------------------------------------------------------------- #
+# Power-cut drill
+# --------------------------------------------------------------------------- #
+
+
+def power_off_node(db: Database, node_id: str) -> dict[str, Any]:
+    """Simulate a sudden power cut on one node.
+
+    In the same transaction: the node stops counting towards ready numbers,
+    and every pending start that targeted it fails with its CPU reservation
+    released. Source replicas of those migrations stay where they are; the
+    affected drains are re-finalised so progress and blocked reasons move.
+    """
+    with db.write() as conn:
+        node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if node is None:
+            raise ApiError(404, "NODE_NOT_FOUND", f"node {node_id!r} does not exist")
+        if not node["powered_on"]:
+            raise ApiError(
+                409,
+                "NODE_ALREADY_POWERED_OFF",
+                f"node {node_id!r} is already powered off",
+            )
+        other_off = conn.execute(
+            "SELECT id, name FROM nodes WHERE powered_on = 0 LIMIT 1"
+        ).fetchone()
+        if other_off is not None:
+            raise ApiError(
+                409,
+                "ANOTHER_NODE_POWERED_OFF",
+                f"node {other_off['id']!r} is already powered off; "
+                "only one node may be cut at a time",
+            )
+
+        conn.execute(
+            "UPDATE nodes SET powered_on = 0 WHERE id = ?", (node_id,)
+        )
+        # Inbound pending starts die with the node; outbound ones (aimed at
+        # other, live nodes) stay decidable.
+        inbound = _starting_migrations(conn, node_id)
+        conn.execute(
+            "UPDATE migrations SET state = 'failed', "
+            "error_code = 'TARGET_POWERED_OFF', error = ?, updated_at = ? "
+            "WHERE state = 'starting' AND target_node_id = ?",
+            (
+                "target node powered off; CPU reservation released, "
+                "source replica still serving",
+                utcnow(),
+                node_id,
+            ),
+        )
+        for drain_id in {row["drain_id"] for row in inbound}:
+            _finalize_drain(conn, drain_id)
+    return snapshot(db)
+
+
+def power_on_node(db: Database, node_id: str) -> dict[str, Any]:
+    """Restore power. Only replicas still placed on the node count again."""
+    with db.write() as conn:
+        node = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if node is None:
+            raise ApiError(404, "NODE_NOT_FOUND", f"node {node_id!r} does not exist")
+        if node["powered_on"]:
+            raise ApiError(
+                409,
+                "NODE_NOT_POWERED_OFF",
+                f"node {node_id!r} is not powered off",
+            )
+        conn.execute(
+            "UPDATE nodes SET powered_on = 1 WHERE id = ?", (node_id,)
+        )
     return snapshot(db)
